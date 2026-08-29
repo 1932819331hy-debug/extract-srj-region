@@ -1,0 +1,6 @@
+.DS_Store
+.cursor/
+bun.lock
+coverage/
+dist/
+node_modules/

@@ -1,0 +1,51 @@
+{
+  "name": "@tscircuit/extract-srj-region",
+  "version": "0.0.1",
+  "description": "Extract bounded Simple Route JSON regions while preserving boundary connectivity",
+  "type": "module",
+  "module": "lib/index.ts",
+  "types": "lib/index.ts",
+  "exports": {
+    ".": "./lib/index.ts"
+  },
+  "files": [
+    "lib",
+    "LICENSE",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tscircuit/extract-srj-region.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tscircuit/extract-srj-region/issues"
+  },
+  "homepage": "https://github.com/tscircuit/extract-srj-region#readme",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun test"
+  },
+  "keywords": [
+    "tscircuit",
+    "simple-route-json",
+    "autorouter",
+    "drc",
+    "pcb"
+  ],
+  "peerDependencies": {
+    "@tscircuit/capacity-autorouter": "*",
+    "typescript": "^5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.11",
+    "@tscircuit/capacity-autorouter": "^0.0.858",
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}
