@@ -1096,4 +1096,59 @@ describe("extractSrjRegion", () => {
     expect(result.jumpers).toHaveLength(1)
     expect(result.jumpers?.[0]?.center).toEqual({ x: 0, y: 0 })
   })
+
+  test("keeps an in-crop connection point when its routed trace is entirely outside", () => {
+    const srj = createSrj({
+      connections: [
+        {
+          name: "pad_net",
+          pointsToConnect: [
+            {
+              x: 0,
+              y: 0,
+              layer: "top",
+              pointId: "pad_point",
+              pcb_port_id: "pcb_port_pad",
+            },
+            {
+              x: 3,
+              y: 3,
+              layer: "top",
+              pointId: "remote_point",
+              pcb_port_id: "pcb_port_remote",
+            },
+          ],
+        },
+      ],
+      traces: [
+        {
+          type: "pcb_trace",
+          pcb_trace_id: "outside_trace",
+          connection_name: "pad_net",
+          route: [
+            { route_type: "wire", x: 2, y: 2, layer: "top", width: 0.1 },
+            { route_type: "wire", x: 3, y: 3, layer: "top", width: 0.1 },
+          ],
+        },
+      ],
+    })
+
+    const result = extractSrjRegion(srj, crop)
+
+    expect(result.traces).toEqual([])
+    expect(result.connections).toEqual([
+      {
+        name: "pad_net",
+        pointsToConnect: [
+          {
+            x: 0,
+            y: 0,
+            layer: "top",
+            pointId: "pad_point",
+            pcb_port_id: "pcb_port_pad",
+          },
+        ],
+      },
+    ])
+  })
 })

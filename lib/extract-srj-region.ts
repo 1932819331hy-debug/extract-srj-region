@@ -1245,7 +1245,9 @@ export const extractSrjRegion = (
     const originalConnection = resolveConnectionForTrace(trace, srj.connections)
     const netContext = traceContexts.get(trace)
     if (!netContext) throw new Error("Missing trace net context")
-    if (originalConnection) consumedConnections.add(originalConnection.name)
+    if (originalConnection && fragments.length > 0) {
+      consumedConnections.add(originalConnection.name)
+    }
 
     for (const [fragmentIndex, fragment] of fragments.entries()) {
       const traceId =
