@@ -133,9 +133,8 @@ describe("extractSrjRegion", () => {
     expect(first.connections).toHaveLength(1)
     expect(first.connections[0]?.name).toBe("net_a__region_trace_a_0")
     expect(first.connections[0]?.__rootConnectionNames).toEqual([
-      "root_a",
       "net_a",
-      "trace_a",
+      "root_a",
     ])
     expect(first.connections[0]?.pointsToConnect).toEqual([
       {
@@ -161,13 +160,17 @@ describe("extractSrjRegion", () => {
       {
         id: "trace_a__boundary_start",
         center: { x: -1, y: 0 },
-        connectedTo: ["net_a__region_trace_a_0", "root_a", "net_a", "trace_a"],
+        connectedTo: ["net_a__region_trace_a_0", "net_a", "root_a"],
       },
       {
         id: "trace_a__boundary_end",
         center: { x: 1, y: 0 },
-        connectedTo: ["net_a__region_trace_a_0", "root_a", "net_a", "trace_a"],
+        connectedTo: ["net_a__region_trace_a_0", "net_a", "root_a"],
       },
+    ])
+    expect(first.traces?.[0]?.connectsTo).toEqual([
+      "net_a__region_trace_a_0__start_point",
+      "net_a__region_trace_a_0__end_point",
     ])
   })
 
@@ -210,6 +213,210 @@ describe("extractSrjRegion", () => {
         .filter((obstacle) => obstacle.obstacleId?.includes("__boundary_"))
         .map((obstacle) => obstacle.width),
     ).toEqual([0.1, 0.1])
+  })
+
+  test("does not alias distinct nets clipped at the same boundary coordinates", () => {
+    const srj = createSrj({
+      connections: [
+        { name: "net_a", pointsToConnect: [] },
+        { name: "net_b", pointsToConnect: [] },
+      ],
+      traces: [
+        {
+          type: "pcb_trace",
+          pcb_trace_id: "trace_a",
+          connection_name: "net_a",
+          connectsTo: ["shared_provenance_alias"],
+          route: [
+            { route_type: "wire", x: -2, y: 0, layer: "top", width: 0.2 },
+            { route_type: "wire", x: 2, y: 0, layer: "top", width: 0.2 },
+          ],
+        },
+        {
+          type: "pcb_trace",
+          pcb_trace_id: "trace_b",
+          connection_name: "net_b",
+          connectsTo: ["shared_provenance_alias"],
+          route: [
+            { route_type: "wire", x: -2, y: 0, layer: "top", width: 0.2 },
+            { route_type: "wire", x: 2, y: 0, layer: "top", width: 0.2 },
+          ],
+        },
+      ],
+    })
+
+    const result = extractSrjRegion(srj, crop)
+    const [connectionA, connectionB] = result.connections
+    if (!connectionA || !connectionB) {
+      throw new Error("Expected two clipped connections")
+    }
+    const coordinateLayerHashes = (connection: typeof connectionA) =>
+      connection.pointsToConnect.map((point) => {
+        const layers = "layers" in point ? point.layers.join("-") : point.layer
+        return `${Math.round(point.x * 100)},${Math.round(point.y * 100)}:${layers}`
+      })
+
+    expect(connectionA.__rootConnectionNames).toEqual(["net_a"])
+    expect(connectionB.__rootConnectionNames).toEqual(["net_b"])
+    expect(result.traces?.[0]?.connectsTo).not.toContain(
+      "shared_provenance_alias",
+    )
+    expect(result.traces?.[1]?.connectsTo).not.toContain(
+      "shared_provenance_alias",
+    )
+    expect(
+      coordinateLayerHashes(connectionA).filter((hash) =>
+        coordinateLayerHashes(connectionB).includes(hash),
+      ),
+    ).toEqual([])
+  })
+
+  test("disambiguates near boundary points with the same rounded connectivity hash", () => {
+    const srj = createSrj({
+      connections: [
+        { name: "narrow_a", pointsToConnect: [] },
+        { name: "narrow_b", pointsToConnect: [] },
+      ],
+      traces: [
+        {
+          type: "pcb_trace",
+          pcb_trace_id: "narrow_trace_a",
+          connection_name: "narrow_a",
+          route: [
+            {
+              route_type: "wire",
+              x: -2,
+              y: 0.001,
+              layer: "top",
+              width: 0.001,
+            },
+            {
+              route_type: "wire",
+              x: 2,
+              y: 0.001,
+              layer: "top",
+              width: 0.001,
+            },
+          ],
+        },
+        {
+          type: "pcb_trace",
+          pcb_trace_id: "narrow_trace_b",
+          connection_name: "narrow_b",
+          route: [
+            {
+              route_type: "wire",
+              x: -2,
+              y: 0.004,
+              layer: "top",
+              width: 0.001,
+            },
+            {
+              route_type: "wire",
+              x: 2,
+              y: 0.004,
+              layer: "top",
+              width: 0.001,
+            },
+          ],
+        },
+      ],
+    })
+
+    const result = extractSrjRegion(srj, crop)
+    const [traceA, traceB] = result.traces ?? []
+    if (!traceA || !traceB) throw new Error("Expected two narrow traces")
+    const hashes = result.connections.map((connection) =>
+      connection.pointsToConnect.map(
+        (point) =>
+          `${Math.round(point.x * 100)},${Math.round(point.y * 100)}:${
+            "layers" in point ? point.layers.join("-") : point.layer
+          }`,
+      ),
+    )
+
+    expect(hashes[0]?.filter((hash) => hashes[1]?.includes(hash))).toEqual([])
+    expect(getWirePoints(traceA)).toContainEqual({
+      x: -1,
+      y: 0.001,
+    })
+    expect(getWirePoints(traceB)[0]?.y).not.toBe(0.004)
+  })
+
+  test("suppresses only unrelated cut-swallowing obstacles outside protected bounds", () => {
+    const obstacles: SimpleRouteJson["obstacles"] = [
+      {
+        obstacleId: "unrelated_pad",
+        type: "rect",
+        layers: ["top"],
+        center: { x: -1.1, y: 0 },
+        width: 0.4,
+        height: 0.4,
+        connectedTo: ["net_b"],
+      },
+      {
+        obstacleId: "same_net_pad",
+        type: "rect",
+        layers: ["top"],
+        center: { x: -1.1, y: 0 },
+        width: 0.4,
+        height: 0.4,
+        connectedTo: ["net_a"],
+      },
+      {
+        obstacleId: "unconnected_keepout",
+        type: "rect",
+        layers: ["top"],
+        center: { x: -1.1, y: 0 },
+        width: 0.4,
+        height: 0.4,
+        connectedTo: [],
+      },
+      {
+        obstacleId: "protected_deep_pad",
+        type: "rect",
+        layers: ["top"],
+        center: { x: -1.1, y: 0 },
+        width: 1,
+        height: 1,
+        connectedTo: ["net_c"],
+      },
+    ]
+    const srj = createSrj({
+      obstacles,
+      connections: [{ name: "net_a", pointsToConnect: [] }],
+      traces: [
+        {
+          type: "pcb_trace",
+          pcb_trace_id: "trace_a",
+          connection_name: "net_a",
+          route: [
+            { route_type: "wire", x: -2, y: 0, layer: "top", width: 0.2 },
+            { route_type: "wire", x: 0, y: 0, layer: "top", width: 0.2 },
+          ],
+        },
+      ],
+    })
+    const protectedBounds = { minX: -0.75, maxX: 0.75, minY: -0.75, maxY: 0.75 }
+
+    const safeDefault = extractSrjRegion(srj, crop)
+    const protectedResult = extractSrjRegion(srj, crop, { protectedBounds })
+
+    expect(
+      safeDefault.obstacles
+        .map((obstacle) => obstacle.obstacleId)
+        .filter((id) => id && !id.includes("__boundary_")),
+    ).toEqual(obstacles.map((obstacle) => obstacle.obstacleId))
+    expect(
+      protectedResult.obstacles
+        .map((obstacle) => obstacle.obstacleId)
+        .filter((id) => id && !id.includes("__boundary_")),
+    ).toEqual(["same_net_pad", "unconnected_keepout", "protected_deep_pad"])
+    expect(() =>
+      extractSrjRegion(srj, crop, {
+        protectedBounds: { ...protectedBounds, minX: -2 },
+      }),
+    ).toThrow("contained")
   })
 
   test("disambiguates shared connection aliases with trace endpoint IDs", () => {
@@ -281,11 +488,11 @@ describe("extractSrjRegion", () => {
     expect(localConnection?.pointsToConnect).toEqual(
       srj.connections[1]?.pointsToConnect,
     )
-    expect(localConnection?.__rootConnectionNames).toEqual([
-      "shared_root",
-      "candidate_b",
-      "shared_trace",
+    expect(localConnection?.__rootConnectionNames).toEqual(["shared_root"])
+    expect(result.traces?.[0]?.connectsTo).toEqual([
+      "b_start",
       "pcb_port_b_start",
+      "b_end",
       "pcb_port_b_end",
     ])
   })
@@ -545,10 +752,10 @@ describe("extractSrjRegion", () => {
     ).toBe(true)
     expect(
       result.connections.every((connection) =>
-        connection.__rootConnectionNames?.includes("reentry_trace"),
+        connection.__rootConnectionNames?.includes("reentry"),
       ),
     ).toBe(true)
-    expect(result.obstacles[0]?.connectedTo).toEqual(["reentry_trace"])
+    expect(result.obstacles[0]?.connectedTo).toEqual(["reentry"])
   })
 
   test("retains crossing jumper and through-obstacle tokens whole", () => {
@@ -601,6 +808,32 @@ describe("extractSrjRegion", () => {
       { x: -1, y: -0.5, layer: "top" },
       { x: 1, y: -0.5, layer: "top" },
     ])
+
+    expect(() =>
+      extractSrjRegion(
+        createSrj({
+          connections: [
+            { name: "first_atomic", pointsToConnect: [] },
+            { name: "second_atomic", pointsToConnect: [] },
+          ],
+          traces: [
+            {
+              type: "pcb_trace",
+              pcb_trace_id: "first_atomic_trace",
+              connection_name: "first_atomic",
+              route: [jumper],
+            },
+            {
+              type: "pcb_trace",
+              pcb_trace_id: "second_atomic_trace",
+              connection_name: "second_atomic",
+              route: [jumper],
+            },
+          ],
+        }),
+        crop,
+      ),
+    ).toThrow("distinct boundary terminal")
   })
 
   test("selects axis-aligned, rotated rectangle, and legacy oval obstacles by intersection", () => {

@@ -2,6 +2,14 @@ import type { SimpleRouteJson } from "@tscircuit/capacity-autorouter"
 
 export type ExtractSrjRegionBounds = SimpleRouteJson["bounds"]
 
+export type ExtractSrjRegionOptions = {
+  /**
+   * Geometry in this sub-region must never be suppressed to break a false
+   * boundary-terminal connectivity alias. Must be contained by `bounds`.
+   */
+  protectedBounds?: ExtractSrjRegionBounds
+}
+
 type Trace = NonNullable<SimpleRouteJson["traces"]>[number]
 type RouteToken = Trace["route"][number]
 type WireToken = Extract<RouteToken, { route_type: "wire" }>
@@ -449,6 +457,16 @@ const obstacleIntersectsBounds = (
     : polygonIntersectsBounds(getRotatedRectCorners(obstacle), bounds)
 }
 
+const pointIsInsideObstacle = (point: Point, obstacle: RuntimeObstacle) => {
+  const isEllipse =
+    obstacle.type === "oval" ||
+    obstacle.shape === "oval" ||
+    obstacle.shape === "circle"
+  return isEllipse
+    ? pointIsInsideEllipse(point, obstacle)
+    : pointIsInsidePolygon(point, getRotatedRectCorners(obstacle))
+}
+
 const getWireNode = (token: WireToken): PathNode => ({
   x: token.x,
   y: token.y,
@@ -598,6 +616,29 @@ const makeWireToken = (node: PathNode): WireToken => {
     layer: node.layer,
     width: node.width,
   }
+}
+
+const addBoundaryTerminalStubs = (
+  fragment: TraceFragment,
+  startTerminal: PathNode,
+  endTerminal: PathNode,
+): RouteToken[] => {
+  const route = clone(fragment.route)
+  if (
+    fragment.startWasCut &&
+    !nodesAreEqual(startTerminal, fragment.start) &&
+    route[0]?.route_type === "wire"
+  ) {
+    route.unshift(makeWireToken(startTerminal))
+  }
+  if (
+    fragment.endWasCut &&
+    !nodesAreEqual(endTerminal, fragment.end) &&
+    route.at(-1)?.route_type === "wire"
+  ) {
+    route.push(makeWireToken(endTerminal))
+  }
+  return route
 }
 
 const appendWireNode = (builder: FragmentBuilder, node: PathNode) => {
@@ -810,6 +851,51 @@ const findMatchingConnectionPoint = (
 const uniqueStrings = (values: Array<string | undefined>) =>
   Array.from(new Set(values.filter((value): value is string => Boolean(value))))
 
+type TraceNetContext = {
+  canonicalName: string
+  aliases: string[]
+  provenanceAliases: Set<string>
+}
+
+const getTraceNetContext = (
+  trace: Trace,
+  originalConnection: Connection | undefined,
+): TraceNetContext => {
+  const canonicalName =
+    originalConnection?.__netConnectionName ?? trace.connection_name
+  const aliases = uniqueStrings([
+    canonicalName,
+    trace.connection_name,
+    originalConnection?.__netConnectionName,
+    originalConnection?.netConnectionName,
+    ...(originalConnection?.__rootConnectionNames ?? []),
+    originalConnection?.rootConnectionName,
+  ])
+  const provenanceAliases = new Set(
+    uniqueStrings([
+      ...aliases,
+      originalConnection?.name,
+      ...(originalConnection?.mergedConnectionNames ?? []),
+      trace.pcb_trace_id,
+      ...(trace.connectsTo ?? []),
+      ...(originalConnection?.pointsToConnect.flatMap((point) => [
+        point.pointId,
+        "pcb_port_id" in point ? point.pcb_port_id : undefined,
+      ]) ?? []),
+    ]),
+  )
+  return { canonicalName, aliases, provenanceAliases }
+}
+
+const getConnectionPointAliases = (point: ConnectionPoint) =>
+  uniqueStrings([
+    point.pointId,
+    "pcb_port_id" in point ? point.pcb_port_id : undefined,
+  ])
+
+const getRoundedCoordinateLayerHash = (node: PathNode) =>
+  `${Math.round(node.x * 100)},${Math.round(node.y * 100)}:${node.layer}`
+
 const resolveConnectionForTrace = (trace: Trace, connections: Connection[]) => {
   const exact = connections.find(
     (connection) => connection.name === trace.connection_name,
@@ -1011,8 +1097,23 @@ const jumperIntersectsBounds = (
 export const extractSrjRegion = (
   srj: SimpleRouteJson,
   bounds: ExtractSrjRegionBounds,
+  options: ExtractSrjRegionOptions = {},
 ): SimpleRouteJson => {
   assertValidBounds(bounds)
+  const { protectedBounds } = options
+  if (protectedBounds) {
+    assertValidBounds(protectedBounds)
+    if (
+      protectedBounds.minX < bounds.minX - EPSILON ||
+      protectedBounds.maxX > bounds.maxX + EPSILON ||
+      protectedBounds.minY < bounds.minY - EPSILON ||
+      protectedBounds.maxY > bounds.maxY + EPSILON
+    ) {
+      throw new Error(
+        "extractSrjRegion protectedBounds must be contained by bounds",
+      )
+    }
+  }
 
   const usedTraceIds = new Set(
     (srj.traces ?? []).map((trace) => trace.pcb_trace_id),
@@ -1033,19 +1134,117 @@ export const extractSrjRegion = (
     ),
   )
 
-  const outputObstacles = srj.obstacles
-    .filter((obstacle) =>
-      obstacleIntersectsBounds(obstacle as RuntimeObstacle, bounds),
-    )
-    .map(clone)
+  const intersectingInputObstacles = srj.obstacles.filter((obstacle) =>
+    obstacleIntersectsBounds(obstacle as RuntimeObstacle, bounds),
+  )
+  const boundaryObstacles: Obstacle[] = []
+  const artificialCutEndpoints: Array<{
+    point: Point
+    provenanceAliases: Set<string>
+  }> = []
   const outputTraces: Trace[] = []
   const outputConnections: Connection[] = []
   const consumedConnections = new Set<string>()
   const connectionReplacements = new Map<string, string[]>()
+  const traceContexts = new Map<Trace, TraceNetContext>()
+  const traceFragments = new Map<Trace, TraceFragment[]>()
+  const canonicalNameByTraceId = new Map<string, string>()
+  const ambiguousTraceIds = new Set<string>()
+  const boundaryTerminalReservations: Array<{
+    node: PathNode
+    canonicalName: string
+  }> = []
+
+  const allocateBoundaryTerminal = (
+    node: PathNode,
+    canonicalName: string,
+    allowShift: boolean,
+  ): PathNode => {
+    const candidateOffsets = [0]
+    if (allowShift) {
+      for (let offsetStep = 1; offsetStep <= 90; offsetStep += 1) {
+        candidateOffsets.push(offsetStep / 100, -offsetStep / 100)
+      }
+    }
+    const onVerticalEdge =
+      Math.abs(node.x - bounds.minX) <= POSITION_EPSILON ||
+      Math.abs(node.x - bounds.maxX) <= POSITION_EPSILON
+    const onHorizontalEdge =
+      Math.abs(node.y - bounds.minY) <= POSITION_EPSILON ||
+      Math.abs(node.y - bounds.maxY) <= POSITION_EPSILON
+    const candidateNodes: PathNode[] = []
+    for (const offset of candidateOffsets) {
+      if (onVerticalEdge) candidateNodes.push({ ...node, y: node.y + offset })
+      if (onHorizontalEdge) candidateNodes.push({ ...node, x: node.x + offset })
+    }
+
+    const terminal = candidateNodes.find((candidate) => {
+      if (!pointIsInsideBounds(candidate, bounds)) return false
+      return boundaryTerminalReservations.every((reservation) => {
+        if (reservation.canonicalName === canonicalName) return true
+        if (
+          getRoundedCoordinateLayerHash(candidate) ===
+          getRoundedCoordinateLayerHash(reservation.node)
+        ) {
+          return false
+        }
+        const halfWidth =
+          Math.max(candidate.width, reservation.node.width) / 2 + EPSILON
+        return (
+          Math.abs(candidate.x - reservation.node.x) > halfWidth ||
+          Math.abs(candidate.y - reservation.node.y) > halfWidth
+        )
+      })
+    })
+    if (!terminal) {
+      throw new Error(
+        `Could not allocate a distinct boundary terminal for ${canonicalName} at (${node.x}, ${node.y})`,
+      )
+    }
+    boundaryTerminalReservations.push({ node: terminal, canonicalName })
+    return terminal
+  }
 
   for (const trace of srj.traces ?? []) {
-    const fragments = clipTrace(trace, bounds, srj.minTraceWidth)
     const originalConnection = resolveConnectionForTrace(trace, srj.connections)
+    const context = getTraceNetContext(trace, originalConnection)
+    const fragments = clipTrace(trace, bounds, srj.minTraceWidth)
+    traceContexts.set(trace, context)
+    traceFragments.set(trace, fragments)
+    const existingCanonicalName = canonicalNameByTraceId.get(trace.pcb_trace_id)
+    if (ambiguousTraceIds.has(trace.pcb_trace_id)) {
+      // Leave ambiguous duplicate IDs unmapped.
+    } else if (existingCanonicalName === undefined) {
+      canonicalNameByTraceId.set(trace.pcb_trace_id, context.canonicalName)
+    } else if (existingCanonicalName !== context.canonicalName) {
+      // Duplicate trace IDs are invalid provenance and cannot be normalized
+      // safely to either net.
+      canonicalNameByTraceId.delete(trace.pcb_trace_id)
+      ambiguousTraceIds.add(trace.pcb_trace_id)
+    }
+    for (const fragment of fragments) {
+      for (const [node, wasCut, routeToken] of [
+        [fragment.start, fragment.startWasCut, fragment.route[0]],
+        [fragment.end, fragment.endWasCut, fragment.route.at(-1)],
+      ] as const) {
+        if (!wasCut || routeToken?.route_type === "wire") continue
+        // Atomic tokens cannot accept a boundary stub. Reserve their exact
+        // intersections before allocating shiftable wire terminals so output
+        // does not depend on trace order.
+        boundaryTerminalReservations.push({
+          node,
+          canonicalName: context.canonicalName,
+        })
+      }
+    }
+  }
+
+  for (const trace of srj.traces ?? []) {
+    const fragments = traceFragments.get(trace)
+    if (!fragments) throw new Error("Missing clipped trace fragments")
+    const originalConnection = resolveConnectionForTrace(trace, srj.connections)
+    const netContext = traceContexts.get(trace)
+    if (!netContext) throw new Error("Missing trace net context")
     if (originalConnection) consumedConnections.add(originalConnection.name)
 
     for (const [fragmentIndex, fragment] of fragments.entries()) {
@@ -1060,17 +1259,21 @@ export const extractSrjRegion = (
         `${trace.connection_name}__region_${trace.pcb_trace_id}_${fragmentIndex}`,
         usedConnectionNames,
       )
-      const rootNames = uniqueStrings([
-        ...(originalConnection?.__rootConnectionNames ?? []),
-        originalConnection?.rootConnectionName,
-        originalConnection?.netConnectionName,
-        originalConnection?.__netConnectionName,
-        originalConnection?.name,
-        ...(originalConnection?.mergedConnectionNames ?? []),
-        trace.connection_name,
-        trace.pcb_trace_id,
-        ...(trace.connectsTo ?? []),
-      ])
+      const rootNames = netContext.aliases
+      const startTerminal = fragment.startWasCut
+        ? allocateBoundaryTerminal(
+            fragment.start,
+            netContext.canonicalName,
+            fragment.route[0]?.route_type === "wire",
+          )
+        : fragment.start
+      const endTerminal = fragment.endWasCut
+        ? allocateBoundaryTerminal(
+            fragment.end,
+            netContext.canonicalName,
+            fragment.route.at(-1)?.route_type === "wire",
+          )
+        : fragment.end
 
       const createEndpoint = (
         node: PathNode,
@@ -1093,11 +1296,11 @@ export const extractSrjRegion = (
       }
 
       const startPoint = createEndpoint(
-        fragment.start,
+        startTerminal,
         "start",
         fragment.startWasCut,
       )
-      const endPoint = createEndpoint(fragment.end, "end", fragment.endWasCut)
+      const endPoint = createEndpoint(endTerminal, "end", fragment.endWasCut)
       const pointsToConnect = [startPoint]
       if (
         !pointsAreEqual(startPoint, endPoint) ||
@@ -1115,8 +1318,7 @@ export const extractSrjRegion = (
           ? { nominalTraceWidth: originalConnection.nominalTraceWidth }
           : {}),
         name: localConnectionName,
-        rootConnectionName:
-          originalConnection?.rootConnectionName ?? rootNames[0],
+        rootConnectionName: netContext.canonicalName,
         __rootConnectionNames: rootNames,
         ...(originalConnection?.netConnectionName
           ? { netConnectionName: originalConnection.netConnectionName }
@@ -1124,22 +1326,25 @@ export const extractSrjRegion = (
         ...(originalConnection?.__netConnectionName
           ? { __netConnectionName: originalConnection.__netConnectionName }
           : {}),
-        ...(originalConnection?.mergedConnectionNames
-          ? {
-              mergedConnectionNames: clone(
-                originalConnection.mergedConnectionNames,
-              ),
-            }
-          : {}),
         pointsToConnect,
       })
 
-      outputTraces.push({
+      const outputTrace = {
         ...clone(trace),
         pcb_trace_id: traceId,
         connection_name: localConnectionName,
-        route: clone(fragment.route),
-      })
+        route: addBoundaryTerminalStubs(fragment, startTerminal, endTerminal),
+      }
+      const retainedEndpointAliases = uniqueStrings([
+        ...getConnectionPointAliases(startPoint),
+        ...getConnectionPointAliases(endPoint),
+      ])
+      if (retainedEndpointAliases.length > 0) {
+        outputTrace.connectsTo = retainedEndpointAliases
+      } else {
+        delete outputTrace.connectsTo
+      }
+      outputTraces.push(outputTrace)
 
       for (const alias of [
         originalConnection?.name,
@@ -1154,13 +1359,24 @@ export const extractSrjRegion = (
         ["end", fragment.end, fragment.endWasCut],
       ] as const) {
         if (!wasCut) continue
+        artificialCutEndpoints.push({
+          point: node,
+          provenanceAliases: netContext.provenanceAliases,
+        })
+        const terminal = endpoint === "start" ? startTerminal : endTerminal
+        if (!pointsAreEqual(terminal, node)) {
+          artificialCutEndpoints.push({
+            point: terminal,
+            provenanceAliases: netContext.provenanceAliases,
+          })
+        }
         const obstacleId = allocateId(
           `${traceId}__boundary_${endpoint}`,
           usedObstacleIds,
         )
-        outputObstacles.push(
+        boundaryObstacles.push(
           createBoundaryObstacle({
-            node,
+            node: terminal,
             obstacleId,
             localConnectionName,
             rootNames,
@@ -1169,6 +1385,40 @@ export const extractSrjRegion = (
       }
     }
   }
+
+  const outputObstacles = intersectingInputObstacles
+    .filter((obstacle) => {
+      if (pointIsInsideBounds(obstacle.center, bounds)) return true
+      if (!protectedBounds) return true
+      if (
+        obstacleIntersectsBounds(obstacle as RuntimeObstacle, protectedBounds)
+      ) {
+        return true
+      }
+      const obstacleAliases = new Set(
+        uniqueStrings([
+          ...obstacle.connectedTo,
+          ...(obstacle.offBoardConnectsTo ?? []),
+        ]),
+      )
+      if (obstacleAliases.size === 0) return true
+      return !artificialCutEndpoints.some(
+        (endpoint) =>
+          pointIsInsideObstacle(endpoint.point, obstacle as RuntimeObstacle) &&
+          !Array.from(endpoint.provenanceAliases).some((alias) =>
+            obstacleAliases.has(alias),
+          ),
+      )
+    })
+    .map((obstacle) => ({
+      ...clone(obstacle),
+      connectedTo: uniqueStrings(
+        obstacle.connectedTo.map(
+          (alias) => canonicalNameByTraceId.get(alias) ?? alias,
+        ),
+      ),
+    }))
+  outputObstacles.push(...boundaryObstacles)
 
   for (const connection of srj.connections) {
     if (consumedConnections.has(connection.name)) continue
