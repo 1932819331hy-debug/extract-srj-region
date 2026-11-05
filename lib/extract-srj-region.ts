@@ -1144,7 +1144,10 @@ export const extractSrjRegion = (
   }> = []
   const outputTraces: Trace[] = []
   const outputConnections: Connection[] = []
-  const consumedConnections = new Set<string>()
+  const retainedConnections = new Map<
+    Connection,
+    { fragments: Connection[]; points: Set<ConnectionPoint> }
+  >()
   const connectionReplacements = new Map<string, string[]>()
   const traceContexts = new Map<Trace, TraceNetContext>()
   const traceFragments = new Map<Trace, TraceFragment[]>()
@@ -1245,8 +1248,12 @@ export const extractSrjRegion = (
     const originalConnection = resolveConnectionForTrace(trace, srj.connections)
     const netContext = traceContexts.get(trace)
     if (!netContext) throw new Error("Missing trace net context")
-    if (originalConnection && fragments.length > 0) {
-      consumedConnections.add(originalConnection.name)
+    let retained = originalConnection
+      ? retainedConnections.get(originalConnection)
+      : undefined
+    if (originalConnection && fragments.length > 0 && !retained) {
+      retained = { fragments: [], points: new Set() }
+      retainedConnections.set(originalConnection, retained)
     }
 
     for (const [fragmentIndex, fragment] of fragments.entries()) {
@@ -1285,7 +1292,10 @@ export const extractSrjRegion = (
         const originalPoint = wasCut
           ? undefined
           : findMatchingConnectionPoint(originalConnection, node)
-        if (originalPoint) return clone(originalPoint)
+        if (originalPoint) {
+          retained?.points.add(originalPoint)
+          return clone(originalPoint)
+        }
         return {
           x: node.x,
           y: node.y,
@@ -1312,7 +1322,7 @@ export const extractSrjRegion = (
         pointsToConnect.push(endPoint)
       }
 
-      outputConnections.push({
+      const localConnection: Connection = {
         ...(originalConnection?.isOffBoard !== undefined
           ? { isOffBoard: originalConnection.isOffBoard }
           : {}),
@@ -1329,7 +1339,9 @@ export const extractSrjRegion = (
           ? { __netConnectionName: originalConnection.__netConnectionName }
           : {}),
         pointsToConnect,
-      })
+      }
+      outputConnections.push(localConnection)
+      retained?.fragments.push(localConnection)
 
       const outputTrace = {
         ...clone(trace),
@@ -1423,7 +1435,19 @@ export const extractSrjRegion = (
   outputObstacles.push(...boundaryObstacles)
 
   for (const connection of srj.connections) {
-    if (consumedConnections.has(connection.name)) continue
+    const retained = retainedConnections.get(connection)
+    const firstFragment = retained?.fragments[0]
+    if (retained && firstFragment) {
+      // A surviving trace represents only its endpoints, not every terminal
+      // of a partially routed net. Keep the remaining local routing obligations
+      // attached to existing same-net copper instead of emitting singletons.
+      for (const point of connection.pointsToConnect) {
+        if (!retained.points.has(point) && pointIsInsideBounds(point, bounds)) {
+          firstFragment.pointsToConnect.push(clone(point))
+        }
+      }
+      continue
+    }
     const pointsToConnect = connection.pointsToConnect
       .filter((point) => pointIsInsideBounds(point, bounds))
       .map(clone)
