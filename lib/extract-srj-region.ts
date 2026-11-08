@@ -735,6 +735,9 @@ const clipTrace = (
         throw new Error("Failed to initialize clipped trace fragment")
       }
       if (!pointsAreEqual(clippedStart, clippedEnd)) {
+        // Vias and atomic tokens end at this coordinate but do not supply
+        // the outgoing wire's origin or width to adjacent-wire consumers.
+        appendWireNode(activeFragment, clippedStart)
         appendWireNode(activeFragment, clippedEnd)
         activeFragment.end = clippedEnd
         activeFragment.hasCopper = true

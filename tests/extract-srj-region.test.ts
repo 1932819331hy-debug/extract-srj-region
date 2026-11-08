@@ -619,6 +619,15 @@ describe("extractSrjRegion", () => {
       "wire",
       "via",
       "wire",
+      "wire",
+    ])
+    // Both ends of the outgoing wire must be explicit after the via so
+    // adjacent-wire consumers retain its copper on the bottom layer.
+    expect(route.filter((token) => token.route_type === "wire")).toEqual([
+      { route_type: "wire", x: -1, y: 0, layer: "top", width: 0.16 },
+      { route_type: "wire", x: 0, y: 0, layer: "top", width: 0.16 },
+      { route_type: "wire", x: 0, y: 0, layer: "bottom", width: 0.16 },
+      { route_type: "wire", x: 1, y: 0, layer: "bottom", width: 0.16 },
     ])
     expect(route.find((token) => token.route_type === "via")).toEqual({
       route_type: "via",
