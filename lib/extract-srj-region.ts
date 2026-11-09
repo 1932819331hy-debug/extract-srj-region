@@ -1056,6 +1056,37 @@ const clipOutline = (
   ) {
     deduplicated.pop()
   }
+  // Clipping can temporarily join separate lobes along a crop edge. If later
+  // edges remove one lobe, that bridge can leave a zero-area backtrack. Remove
+  // redundant crop-edge vertices before testing the surviving ring's topology.
+  for (
+    let index = 0;
+    index < deduplicated.length && deduplicated.length >= 3;
+  ) {
+    const previous =
+      deduplicated[(index + deduplicated.length - 1) % deduplicated.length]
+    const current = deduplicated[index]
+    const next = deduplicated[(index + 1) % deduplicated.length]
+    if (!previous || !current || !next) return undefined
+    const onVerticalBoundary =
+      (current.x === bounds.minX || current.x === bounds.maxX) &&
+      previous.x === current.x &&
+      next.x === current.x
+    const onHorizontalBoundary =
+      (current.y === bounds.minY || current.y === bounds.maxY) &&
+      previous.y === current.y &&
+      next.y === current.y
+    if (
+      pointsAreEqual(previous, current) ||
+      onVerticalBoundary ||
+      onHorizontalBoundary
+    ) {
+      deduplicated.splice(index, 1)
+      index = 0
+    } else {
+      index += 1
+    }
+  }
   if (deduplicated.length < 3) return undefined
   // A single SRJ outline cannot represent disconnected intersections. A
   // concave board clipped across separate lobes produces a weakly-simple ring
